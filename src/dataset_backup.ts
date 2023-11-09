@@ -1,6 +1,6 @@
 // A Dataset manages the production and manipulation of *tiles*.
-import { Tile, Rectangle, p_in_rect } from './tile';
-import { min, max, bisectLeft, extent } from 'd3-array';
+import { Tile, Rectangle, QuadTile, p_in_rect } from './tile';
+import { range, min, max, bisectLeft, extent, sum } from 'd3-array';
 import type * as DS from './shared';
 import {
   RecordBatch,
@@ -16,14 +16,13 @@ import {
   Field,
   List,
   Int,
+  Float,
   Utf8,
   Uint64,
   Type,
-  Uint8,
-  tableToIPC
+  Uint8
 } from 'apache-arrow';
 import Scatterplot from './deepscatter';
-import { wrapArrowTable } from './wrapArrow';
 
 type Key = string;
 
@@ -37,70 +36,24 @@ type Transformation = DS.Transformation;
  */
 export class Dataset {
   public transformations: Record<string, Transformation> = {};
+  root_tile: Tile;
   protected plot: DS.Plot;
+  ready: Promise<void>;
+  promise: Promise<void>;
   private extents: Record<string, [number, number]> = {};
   // A 3d identifier for the tile. Usually [z, x, y]
   public _ix_seed = 0;
   public _schema?: Schema;
   public tileProxy?: DS.TileProxy;
-  protected _download_queue: Set<Key> = new Set();
-  public promise: Promise<void>;
-  public root_tile: Tile;
 
   /**
    * @param plot The plot to which this dataset belongs.
    **/
 
-  constructor(
-    base_url: string,
-    plot: DS.Plot,
-    options: DS.DatasetOptions = {}
-  ) {
+  constructor(plot: DS.Plot) {
     this.plot = plot;
-    this.tileProxy = options.tileProxy;
-    this.root_tile = new Tile('0/0/0', null, this, base_url);
-    const download = this.root_tile.download();
-    this.promise = download.then(
-      (d) => {
-      const schema = this.root_tile.record_batch.schema;
-      if (schema.metadata.has('sidecars')) {
-        const cars = schema.metadata.get('sidecars');
-        const parsed = JSON.parse(cars) as Record<string, string>;
-        for (const [k, v] of Object.entries(parsed)) {
-          this.transformations[k] = async function (tile) {
-            const batch = await tile.get_arrow(v);
-            const column = batch.getChild(k);
-            if (column === null) {
-              throw new Error(
-                `No column named ${k} in sidecar tile ${batch.schema.fields
-                  .map((f) => f.name)
-                  .join(', ')}`
-              );
-            }
-            return column;
-          };
-        }
-      } else {
-        // "NO SIDECARS"
-      }
-    });
-  }
-
-  get ready() {
-    return this.root_tile.download();
-  }
-
-  get extent() {
-    return this.root_tile.extent;
-  }
-
-  /**
-   * Ensures that all the tiles in a dataset are downloaded that include 
-   * datapoints of index less than or equal to max_ix.
-   * @param max_ix the depth to download to.
-   */
-  async download_to_depth(max_ix: number) {
-    await this.root_tile.download_to_depth(max_ix);
+    // If a linear identifier does not exist in the passed data, we add the ix columns in the order that
+    // they are passed.
   }
 
   /**
@@ -157,6 +110,9 @@ export class Dataset {
     this.transformations[name] = transform;
   }
 
+  download_to_depth(max_ix: number) {
+    return Promise.resolve()
+  }
   /**
    * Attempts to build an Arrow table from all record batches.
    * If some batches have different transformations applied,
@@ -182,21 +138,11 @@ export class Dataset {
     return new Dataset(url, plot, options);
   }
 
-
-  /**
-   * Generate an ArrowDataset from a single Arrow table.
-   *
-   * @param table A single Arrow table
-   * @param prefs The API Call to use for renering.
-   * @param plot The Scatterplot to use.
-   * @returns
-   */
-  static from_arrow_table(
-    table: Table,
-    plot: Scatterplot
-  ): Dataset {
-    return wrapArrowTable(tableToIPC(table), plot)
-  }
+  abstract download_most_needed_tiles(
+    bbox: Rectangle | undefined,
+    max_ix: number,
+    queue_length: number
+  ): void;
 
   /**
    *
@@ -261,8 +207,8 @@ export class Dataset {
   }
 
   *points(bbox: Rectangle | undefined, max_ix = 1e99) {
-    const stack: Tile[] = [this.root_tile];
-    let current : Tile;
+    const stack: T[] = [this.root_tile];
+    let current : T;
     while ((current = stack.shift())) {
       if (
         current.download_state == 'Complete' &&
@@ -290,9 +236,9 @@ export class Dataset {
    * @returns A list of the results of the function in an order determined by 'after.'
    */
 
-  map<U>(callback: (tile: Tile) => U, after = false): U[] {
+  map<U>(callback: (tile: T) => U, after = false): U[] {
     const results: U[] = [];
-    this.visit((d: Tile) => {
+    this.visit((d: T) => {
       results.push(callback(d));
     }, after);
     return results;
@@ -409,7 +355,7 @@ export class Dataset {
         `Can't overwrite existing transformation for ${field_name}`
       );
     }
-    this.transformations[field_name] = function (tile: Tile) {
+    this.transformations[field_name] = function (tile: T) {
       return supplement_identifiers(
         tile.record_batch,
         ids,
@@ -459,7 +405,7 @@ export class Dataset {
    */
   findPointRaw(ix: number): [Tile, StructRowProxy, number][] {
     const matches: [Tile, StructRowProxy, number][] = [];
-    this.visit((tile: Tile) => {
+    this.visit((tile: T) => {
       if (
         !(
           tile.ready &&
@@ -478,114 +424,6 @@ export class Dataset {
       }
     });
     return matches;
-  }
-
-  download_most_needed_tiles(
-    bbox: Rectangle | undefined,
-    max_ix: number,
-    queue_length = 4
-  ) {
-    /*
-      Browsing can spawn a  *lot* of download requests that persist on
-      unneeded parts of the database. So the tile handles its own queue for dispatching
-      downloads in case tiles have slipped from view while parents were requested.
-    */
-
-    const queue = this._download_queue;
-
-    if (queue.size >= queue_length) {
-      return;
-    }
-
-    const scores: [number, Tile, Rectangle][] = [];
-
-    function callback(tile: Tile) {
-      if (bbox === undefined) {
-        // Just depth.
-        return 1 / tile.codes[0];
-      }
-      if (tile.download_state === 'Unattempted') {
-        const distance = check_overlap(tile, bbox);
-        scores.push([distance, tile, bbox]);
-      }
-    }
-
-    this.visit(callback);
-
-    scores.sort((a, b) => Number(a[0]) - Number(b[0]));
-    while (scores.length > 0 && queue.size < queue_length) {
-      const upnext = scores.pop();
-      if (upnext === undefined) {
-        throw new Error('Ran out of tiles unexpectedly');
-      }
-      const [distance, tile, _] = upnext;
-      if ((tile.min_ix && tile.min_ix > max_ix) || distance <= 0) {
-        continue;
-      }
-      queue.add(tile.key);
-      tile
-        .download()
-        .then(() => queue.delete(tile.key))
-        .catch((error) => {
-          console.warn('Error on', tile.key);
-          queue.delete(tile.key);
-          throw error;
-        });
-    }
-  }
-
-  /**
-   *
-   * @param field_name the name of the column to create
-   * @param buffer An Arrow IPC Buffer that deserializes to a table with columns('data' and '_tile')
-   */
-  add_macrotiled_column(
-    field_name: string,
-    transformation: (ids: string[]) => Promise<Uint8Array>
-  ): void {
-    const macrotile_tasks: Record<string, Promise<void>> = {};
-    const records: Record<string, ArrowBuildable> = {};
-
-    async function get_table(tile: Tile)  {
-      const { macrotile } = tile;
-      if (macrotile_tasks[macrotile] !== undefined) {
-        return await macrotile_tasks[macrotile];
-      } else {
-        macrotile_tasks[macrotile] = transformation(tile.macro_siblings).then(
-          (buffer) => {
-            const tb = tableFromIPC(buffer);
-            for (const batch of tb.batches) {
-              const data = batch.getChild('data') as Vector<List<DS.SupportedArrowTypes>>
-              for (let i = 0; i < batch.data.length; i++) {
-                const tilename = batch.getChild('_tile').get(i) as string;
-                records[tilename] = data.get(i)
-              }
-            }
-            return;
-          }
-        );
-        return macrotile_tasks[macrotile];
-      }
-    }
-
-    this.transformations[field_name] = async function (tile) {
-      await get_table(tile);
-      const array = records[tile.key];
-      if (array instanceof Uint8Array) {
-        const v = new Float32Array(array.length);
-        for (let i = 0; i < tile.record_batch.numRows; i++) {
-          // pop out the bitmask one at a time.
-          const byte = array[i];
-          for (let j = 0; j < 8; j++) {
-            const bit = (byte >> j) & 1;
-            v[i * 8 + j] = bit;
-          }
-        }
-        return v;
-      } else {
-        return array;
-      }
-    };
   }
 }
 
@@ -759,3 +597,6 @@ function supplement_identifiers(
   }
   return updatedFloatArray;
 }
+
+export const QuadtileDataset = Dataset;
+
