@@ -20,7 +20,11 @@ import {
   Uint64,
   Type,
   Uint8,
-  tableToIPC
+  tableToIPC,
+  Dictionary,
+  Int16,
+  Int32,
+  Int8
 } from 'apache-arrow';
 import Scatterplot from './deepscatter';
 import { wrapArrowTable } from './wrapArrow';
@@ -665,7 +669,18 @@ export function add_or_delete_column(
     } else if (data instanceof Uint8Array) {
       tb[field_name] = makeVector({ type: new Uint8(), data, length: data.length }).data[0];
     } else if ((data as Vector<DS.SupportedArrowTypes>).data.length > 0) {
-      tb[field_name] = data.data[0];
+      let newval = data.data[0];
+      if (newval.dictionary) {
+        const dicto = newval as Data<Dictionary<Utf8, Int8 | Int16 | Int32>>;
+        const dictionary_id = max([0, ...batch.schema.dictionaries.keys()]) + 1;
+        const newv = makeVector({
+          data: dicto.values,  // indexes into the dictionary
+          dictionary: dicto.dictionary as Vector<Utf8>, // keys
+          type: new Dictionary(dicto.type.dictionary, dicto.type.indices, dictionary_id) // increment the identifier.
+        });
+        newval = newv.data[0];
+      }
+      tb[field_name] = newval;
     } else {
       console.warn(`Unknown data format object passed to add or remove columns--treating as Data, but this behavior is deprecated`, data)
       // Stopgap--maybe somewhere there are 
@@ -673,7 +688,7 @@ export function add_or_delete_column(
     }
   }
 
-  const new_batch = new RecordBatch(tb);
+  const new_batch = new RecordBatch(tb)
   for (const [k, v] of batch.schema.metadata) {
     new_batch.schema.metadata.set(k, v);
   }
