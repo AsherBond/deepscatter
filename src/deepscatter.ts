@@ -224,13 +224,13 @@ class Scatterplot {
    */
   join(
     name: string,
-    codes: Record<string | number, number>,
+    codes: Record<string, number>,
     key_field: string
   ) {
     let true_codes: Record<string, number> 
     
     if (Array.isArray(codes)) {
-      true_codes = Object.fromEntries(codes.map((next : string | bigint) => [next, 1]))
+      true_codes = Object.fromEntries(codes.map((next : string | bigint) => [String(next), 1]))
     } else {
       this._root.add_label_identifiers(true_codes, name, key_field);
     }
@@ -286,7 +286,8 @@ class Scatterplot {
     const labels = new LabelMaker(this, name, options);
     labels.update(features, label_key, size_key);
     this.secondary_renderers[name] = labels;
-    this.secondary_renderers[name].start();
+    const r = this.secondary_renderers[name] as LabelMaker;
+    r.start();
   }
 
   /**
@@ -451,7 +452,9 @@ class Scatterplot {
    */
   public destroy() {
     this._renderer?.regl?.destroy();
-    this.div?.node().parentElement.replaceChildren();
+
+    const node = this.div?.node() as Node;
+    node.parentElement.replaceChildren();
   }
 
   update_prefs(prefs: DS.APICall) {
@@ -495,8 +498,8 @@ class Scatterplot {
     for (const [k, v] of Object.entries(this.secondary_renderers)) {
       // Stop any existing labels
       if (v && v['label_key'] !== undefined) {
-        this.secondary_renderers[k].stop();
-        this.secondary_renderers[k].delete();
+        (this.secondary_renderers[k] as LabelMaker).stop();
+        (this.secondary_renderers[k] as LabelMaker).delete();
         this.secondary_renderers[k] = undefined;
       }
     }
@@ -510,7 +513,7 @@ class Scatterplot {
    * @returns
    */
 
-  public dim(dimension: string): ConcreteAesthetic {
+  public dim(dimension: DS.Dimension): ConcreteAesthetic {
     return this._renderer.aes.dim(dimension).current as ConcreteAesthetic;
   }
 
@@ -523,7 +526,7 @@ class Scatterplot {
     return this.tooltip_handler.f;
   }
 
-  set label_click(func) {
+  set label_click(func : (d: Record<string, unknown>) => void) {
     this.label_click_handler.f = func;
   }
 
@@ -595,7 +598,7 @@ class Scatterplot {
       }
       for (const [k, v] of Object.entries(prefs.encoding)) {
         if (v && typeof v !== 'string' && v['field'] !== undefined) {
-          needed_keys.add(v['field']);
+          needed_keys.add(v['field'] as string);
         }
       }
       // I want to use this number to determine how much longer to wait.
@@ -659,10 +662,10 @@ class Scatterplot {
       return;
     }
     if (prefs.click_function) {
-      this.click_function = Function('datum', prefs.click_function) as unknown as ClickFunction;
+      this.click_function = Function('datum', prefs.click_function) as RowFunction<void>;
     }
     if (prefs.tooltip_html) {
-      this.tooltip_html = Function('datum', prefs.tooltip_html) as unknown as TooltipHTML;
+      this.tooltip_html = Function('datum', prefs.tooltip_html) as RowFunction<string>;
     }
 
     if (prefs.background_options) {
@@ -710,26 +713,6 @@ class Scatterplot {
       await this.reinitialize();
     }
 
-    // Doesn't block.
-    /*
-    if (prefs.basemap_geojson) {
-      this.registerBackgroundMap(prefs.basemap_geojson)
-    }
-    */
-
-    if (prefs.basemap_gleofeather) {
-      // Deprecated.
-      prefs.polygons = [{ file: prefs.basemap_gleofeather }];
-    }
-
-    /*
-    if (prefs.polygons) {
-      for (const polygon of prefs.polygons) {
-        this.registerPolygonMap(polygon);
-      }
-    }
-    */
-
     this._renderer.render_props.apply_prefs(this.prefs);
 
     const { width, height } = this;
@@ -751,7 +734,8 @@ class Scatterplot {
       this._renderer.apply_webgl_scale(prefs);
     }
     if (this._renderer.reglframe) {
-      this._renderer.reglframe.cancel();
+      const r = this._renderer.reglframe
+      r.cancel();
       this._renderer.reglframe = undefined;
     }
 
@@ -765,7 +749,7 @@ class Scatterplot {
         const name = (prefs.labels.name || url) as string;
         if (!this.secondary_renderers[name]) {
           this.stop_labellers();
-          this.add_labels_from_url(url, name, label_field, size_field).catch(
+          this.add_labels_from_url(url, name, label_field, size_field, {}).catch(
             (error) => {
               console.error('Label addition failed.');
               console.error(error);
@@ -805,33 +789,6 @@ class Scatterplot {
     return p;
   }
 
-  drawContours(contours, drawTo) {
-    const drawTwo = drawTo || select('body');
-    const canvas = drawTwo.select('#canvas-2d');
-    const context: CanvasRenderingContext2D = canvas.node().getContext('2d');
-
-    for (const contour of contours) {
-      context.fillStyle = 'rgba(25, 25, 29, 1)';
-      context.fillRect(0, 0, window.innerWidth * 2, window.innerHeight * 2);
-
-      context.strokeStyle = '#8a0303'; // "rbga(255, 255, 255, 1)"
-      context.fillStyle = 'rgba(30, 30, 34, 1)';
-
-      context.lineWidth = max([
-        0.45,
-        0.25 * Math.exp(Math.log(this._zoom.transform.k / 2)),
-      ]);
-
-      const path = geoPath(
-        geoIdentity()
-          .scale(this._zoom.transform.k)
-          .translate([this._zoom.transform.x, this._zoom.transform.y]),
-        context
-      );
-      context.beginPath(), path(contour), context.fill();
-    }
-  }
-
   sample_points(n = 10): Record<string, number | string>[] {
     const vals: Record<string, number | string>[] = [];
     for (const p of this._root.points(this._zoom.current_corners())) {
@@ -842,29 +799,6 @@ class Scatterplot {
     }
     vals.sort((a, b) => Number(a.ix) - Number(b.ix));
     return vals.slice(0, n);
-  }
-
-  contours(aes) {
-    const data = this._renderer.calculate_contours(aes);
-    const { x, y, x_, y_ } = this._zoom.scales();
-    function fix_point(p) {
-      if (!p) {
-        return;
-      }
-      if (p.coordinates) {
-        return fix_point(p.coordinates);
-      }
-      if (p.length === 0) {
-        return;
-      }
-      if (p[0].length > 0) {
-        return p.map(fix_point);
-      }
-      p[0] = x(x_.invert(p[0]));
-      p[1] = y(y_.invert(p[1]));
-    }
-    fix_point(data);
-    this.drawContours(data);
   }
 }
 
@@ -916,7 +850,6 @@ abstract class SettableFunction<
 }
 
 import type { GeoJsonProperties } from 'geojson';
-import { Aesthetic } from './Aesthetic';
 import { default_API_call } from './defaults';
 
 class LabelClick extends SettableFunction<void, GeoJsonProperties> {
@@ -934,9 +867,11 @@ class LabelClick extends SettableFunction<void, GeoJsonProperties> {
       feature.__activated = undefined;
     } else {
       feature.__activated = true;
+      const k = labelset.label_key;
+      const value = feature[k] as string;
       filter = {
         field: labelset.label_key,
-        lambda: `d => d === '${feature.properties[labelset.label_key]}'`,
+        lambda: `d => d === '${value}'`,
       };
     }
     void this.plot.plotAPI({
@@ -956,14 +891,13 @@ class ChangeToHighlitPointFunction extends SettableFunction<
   void,
   StructRowProxy[]
   > {
-    default(points: StructRowProxy[], plot = undefined) {
-      // console.log({points})
+    default(points: StructRowProxy[], plot : Scatterplot = undefined) {
       return;
     }
   }
 
 class TooltipHTML extends SettableFunction<string> {
-  default(point: StructRowProxy, plot = undefined) {
+  default(point: StructRowProxy, plot : Scatterplot = undefined) {
     // By default, this returns a
     let output = '<dl>';
     const nope: Set<string | null | number | symbol> = new Set([
@@ -991,3 +925,6 @@ class TooltipHTML extends SettableFunction<string> {
     return `${output}</dl>\n`;
   }
 }
+
+
+type RowFunction<T> = (datum: StructRowProxy, plot : Scatterplot | undefined) => T
