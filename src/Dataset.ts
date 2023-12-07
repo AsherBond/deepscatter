@@ -344,6 +344,108 @@ export class Dataset {
     }
   }
 
+    /**
+   * Invoke a function on all tiles in the dataset that have been downloaded.
+   * The general architecture here is taken from the
+   * d3 quadtree functions. That's why, for example, it doesn't
+   * recurse.
+
+   * @param callback The function to invoke on each tile.
+   * @param after Whether to execute the visit in bottom-up order. Default false.
+   * @param filter 
+   */
+
+    async visit_full(
+      callback: (tile: Tile) => Promise<void>,
+      after = false,
+      filter: (t: Tile) => boolean = (x) => true
+    ) {
+
+      // Visit all children with a callback function.
+      // In general recursing quadtrees isn't that fast, but
+      // we rarely have more than ten tiles deep and the
+      // code is much cleaner this way than an async queue.
+
+      async function resolve(tile: Tile) {
+        await tile.download();
+        if (after) {
+          await Promise.all(tile.children.map(resolve))
+          await callback(tile);
+        } else {
+          await callback(tile);
+          await Promise.all(tile.children.map(resolve))
+        }
+      }
+      await resolve(this.root_tile);
+    }
+    
+    /**
+   * Invoke a function on all tiles in the dataset that have been downloaded.
+   * The general architecture here is taken from the
+   * d3 quadtree functions. That's why, for example, it doesn't
+   * recurse.
+
+   * @param callback The function to invoke on each tile.
+   * @param after Whether to execute the visit in bottom-up order. Default false.
+   * @param filter 
+   */
+
+  async visit_complete(
+      callback: (tile: Tile) => void,
+      starting_tile: Tile | null,
+      after: boolean = false,
+      filter: (t: Tile) => boolean = (x) => true,
+      progress_function : (executed_points: number, total_points: number) => unknown = (executed_points: number, total_points: number) => void
+    ) {
+      // Visit all children with a callback function.
+  
+      function get_tile(t: Tile) {
+        await t.download()
+        return t
+      }
+
+      const stack: Tile[] = [starting_tile || this.root_tile];
+      const total_points = stack[0];
+
+      // A list of unfetched promises.
+      const async_stack = new AsyncQueue<Tile[]>([])
+      const after_stack = [];
+
+      let current : Tile;
+      while (stack.length > 0) {
+        current = stack.shift()
+        if (!after) {
+          callback(current);
+          progress_function()
+        } else {
+          after_stack.push(current);
+        }
+        if (!filter(current)) {
+          continue;
+        }
+        // Only create children for downloaded tiles.
+        if (current.download_state == 'Complete') {
+          stack.push(...current.children);
+        } else {
+          async function download(tile) {
+            await tile.download()
+            return tile.children;
+          }
+          async_stack.add(download(current))
+        }
+        // Race to complete from the stack. Wrapped in a 
+        // while loop because a tile might have no children.
+        while (stack.length === 0 && async_stack.length > 0) {
+          stack.concat(await async_stack.apop())
+        }
+      }
+      if (after) {
+        while ((current = after_stack.pop() as Tile)) {
+          callback(current);
+        }
+      }
+    }
+
   async schema() {
     await this.ready;
     if (this._schema) {
@@ -773,4 +875,50 @@ function supplement_identifiers(
     }
   }
   return updatedFloatArray;
+}
+
+
+class AsyncQueue<T> {
+  private promises: Promise<T>[] = [];
+
+  constructor(promises: Promise<T>[] = []) {
+    this.promises.concat(promises)
+  }
+
+  add(promise: Promise<T>): void {
+    // Add a promise onto the queue.
+      this.promises.push(promise);
+  }
+
+  private removeFromArray(item: Promise<T>): void {
+      const index = this.promises.indexOf(item);
+      if (index > -1) {
+          this.promises.splice(index, 1);
+      }
+  }
+
+  async apop(): Promise<T> {
+    /**
+     * Pop the first promise to resolve off the queue.
+     */
+      if (this.promises.length === 0) {
+          throw new Error("No promises to race");
+      }
+
+      return new Promise((resolve, reject) => {
+          this.promises.forEach(promise => {
+              promise.then((value) => {
+                  this.removeFromArray(promise);
+                  resolve(value);
+              }).catch((error) => {
+                  this.removeFromArray(promise);
+                  reject(error);
+              });
+          });
+      });
+  }
+
+  get length(): number {
+      return this.promises.length;
+  }
 }
