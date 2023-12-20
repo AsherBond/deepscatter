@@ -393,10 +393,10 @@ export class Dataset {
   async visit_complete(
       callback: (tile: Tile) => void,
       starting_tile: Tile | null,
-      after: boolean = false,
+      after = false,
       filter: (t: Tile) => boolean = (x) => true,
-      progress_function : (executed_points: number, total_points: number) => unknown = (executed_points: number, total_points: number) => void
-    ) {
+      progress_function : (executed_points: number, total_points: number) => unknown = (executed_points: number, total_points: number) => undefined
+   ) {
       // Visit all children with a callback function.
   
       function get_tile(t: Tile) {
